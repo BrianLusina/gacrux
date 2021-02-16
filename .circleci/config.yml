@@ -1,0 +1,178 @@
+version: 2.1
+parameters:
+  workingdir:
+    type: string
+    default: "~/gacrux-infra"
+  node-image-tag:
+    type: string
+    default: "10"
+
+executors:
+  terra-executor:
+    docker:
+      - image: amazon/aws-cli
+    working_directory: << pipeline.parameters.workingdir >>
+  
+  ansible-executor:
+    docker:
+      - image: python:3.7-alpine3.11
+    working_directory: << pipeline.parameters.workingdir >>
+  
+  smoke-executor:
+    docker:
+      - image: amazon/aws-cli
+    working_directory: << pipeline.parameters.workdingdir >>
+
+  docker-executor:
+    docker:
+      - image: docker:17.05.0-ce-git
+    working_directory: << pipeline.parameters.workingdir >>
+
+  node-executor:
+    docker:
+      - image: circleci/node:<< pipeline.parameters.node-image-tag >>
+    working_directory: << pipeline.parameters.workingdir >>
+
+commands:
+  destroy_environments:
+    steps:
+      - run:
+          name: Destroy Environment
+          command: |
+            aws cloudformation delete-stack --stack-name prod-${CIRCLE_WORKFLOW_ID}
+
+jobs:
+
+  publish_release:
+    executor: node-executor
+    steps:
+      - attach_workspace:
+          at: .
+
+      - run:
+          name: Publish release
+          command: npx semantic-release
+
+  create_and_deploy_frontend:
+    executor: terra-executor
+    steps:
+      - attach_workspace:
+          at: .
+      # ${CIRCLE_WORKFLOW_ID:0:7} takes the first 7 chars of the variable CIRCLE_CI_WORKFLOW_ID`
+      - run:
+          name: Deploy Frontend
+          command: |
+            aws cloudformation deploy \
+              --template-file infra/web/bucket.yml \
+              --stack-name "gacrux-frontend-${CIRCLE_WORKFLOW_ID:0:7}" \
+              --parameter-overrides PipelineID="${CIRCLE_WORKFLOW_ID:0:7}"
+
+      - run: aws s3 sync . s3://"garcrux-frontend-${CIRCLE_WORKFLOW_ID}" --delete
+  
+  get_last_deployment_id:
+    executor: terra-executor
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Get Last Deployment ID
+          command: aws cloudformation list-exports --query "Exports[?Name==\`PipelineID\`].Value" --no-paginate --output text > last_deployment.txt
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+  
+  promote_frontend-to_production:
+    executor: terra-executor
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Promote To Production 
+          command: |
+            aws cloudformation deploy \
+              --template-file infra/web/cloudfront.yml \
+              --stack-name gacrux-frontend-prod \
+              --parameter-overrides PipelineID="${CIRCLE_WORKFLOW_ID}"
+  
+  clean_up_old_frontend:
+    executor: terra-executor
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Tear down old frontend
+          command: |
+            aws s3 rm "s3://${OldPipelineID}" --recursive
+            aws cloudformation delete-stack --stack-name "${PreviousPipelineID}"
+
+  create_infrastructure:
+    executor: terra-executor
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Ensure Backend infrastructure exists
+          command: aws cloudformation deploy --template-file infra/servers/servers.yaml --stack-name gacrux-${CIRCLE_WORKFLOW_ID}
+
+  configure_infrastracture:
+    executor: ansible-executor
+    steps:
+      - attach_workspace:
+          at: .
+      - add_ssh_keys:
+          fingerprints:
+            - fa:aa:7f:be:e4:a9:0c:17:30:91:2a:54:c9:7e:3f:5b
+      - run:
+          name: Install dependencies
+          command: apk add --update ansible
+      - run:
+          name: Configure server
+          command: ansible-playbook playbook/main.yaml -i inventory playbook.yml
+  
+  smoke_test:
+    executor: smoke-executor
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run Smoke Test
+          command: ./scripts/smoke-test.sh
+      - destroy_environments
+        when: on_fail
+
+workflows:
+  version: 2
+  test_build_push_tag:
+    jobs:
+
+      - publish_release:
+          context: thelusina-context
+          filters:
+            branches:
+              only:
+                - production
+                - rc
+                - beta
+                - alpha
+          requires:
+            - push_production
+            - push_rc
+            - push_beta
+            - push_alpha
+      
+      - create_and_deploy_frontend
+      - get_last_deployment_id
+      - promote_frontend-to_production
+      - clean_up_old_frontend
+      
+      - create_infrastructure:
+          context: thelusina-context
+      
+      - configure_infrastracture:
+          requires:
+            - create_infrastructure
+
+      - smoke_test:
+          requires:
+            - configure_infrastructure
